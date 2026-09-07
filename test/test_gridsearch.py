@@ -9,7 +9,7 @@ from gridsearch.search import _build_optimizer
 from gridsearch.space import OPTIMIZERS, sample_configs, select_configs
 
 
-def test_lhs_draws_n_samples_per_optimizer_and_is_reproducible():
+def test_sobol_draws_n_samples_per_optimizer_and_is_reproducible():
     configs = sample_configs(n_samples=7, seed=123)
 
     assert len(configs) == 7 * len(OPTIMIZERS)

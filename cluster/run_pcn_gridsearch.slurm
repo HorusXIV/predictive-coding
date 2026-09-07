@@ -7,7 +7,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --array=0-2%3
 
-SEARCH_ARGS=(--n-samples 100 --num-epochs 10)
+SEARCH_ARGS=(--n-samples 128 --num-epochs 10)
 
 set -euo pipefail
 

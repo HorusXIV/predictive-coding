@@ -30,16 +30,19 @@ SEARCH_SPACE = [
 
 _OPTIMIZER_DIM = next(dim for dim in SEARCH_SPACE if dim[0] == "optimizer")
 OPTIMIZERS = _OPTIMIZER_DIM[2]
-_LHS_SPACE = [dim for dim in SEARCH_SPACE if dim[0] != "optimizer"]
+_NUMERIC_SPACE = [dim for dim in SEARCH_SPACE if dim[0] != "optimizer"]
 
 
 def sample_configs(n_samples: int, seed: int) -> list[dict]:
-    """Draw ``n_samples`` Latin-Hypercube configurations *per optimizer*.
+    """Draw ``n_samples`` scrambled-Sobol configurations *per optimizer*.
 
     The continuous and integer hyperparameters form an independent
-    space-filling design for each optimizer.  Thus ``--n-samples 250`` yields
-    250 Adam, 250 SGD, and 250 Muon configurations (750 total), rather than
-    assigning roughly a third of 250 configurations to each optimizer.
+    space-filling design for each optimizer.  Thus ``--n-samples 128`` yields
+    128 Adam, 128 SGD, and 128 Muon configurations (384 total), rather than
+    assigning roughly a third of 128 configurations to each optimizer.
+
+    Sobol balance holds when ``n_samples`` is a power of two; scipy warns for
+    other sizes.
     """
     if n_samples < 1:
         raise ValueError("n_samples must be at least 1")
@@ -48,11 +51,11 @@ def sample_configs(n_samples: int, seed: int) -> list[dict]:
     optimizer_seeds = seed_sequence.spawn(len(OPTIMIZERS))
     configs = []
     for optimizer, optimizer_seed in zip(OPTIMIZERS, optimizer_seeds):
-        sampler = qmc.LatinHypercube(
-            d=len(_LHS_SPACE), seed=np.random.default_rng(optimizer_seed)
+        sampler = qmc.Sobol(
+            d=len(_NUMERIC_SPACE), scramble=True, seed=np.random.default_rng(optimizer_seed)
         )
         configs.extend(
-            {**_decode(point, _LHS_SPACE), "optimizer": optimizer}
+            {**_decode(point, _NUMERIC_SPACE), "optimizer": optimizer}
             for point in sampler.random(n=n_samples)
         )
 

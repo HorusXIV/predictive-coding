@@ -1,10 +1,10 @@
-"""Search PCN hyperparameters with a Latin Hypercube space-filling design,
+"""Search PCN hyperparameters with a scrambled-Sobol space-filling design,
 score each candidate by 5-fold cross-validation on the MNIST *train* split,
 and write both a per-fold table and a summary table.
 
 ``--n-samples`` is the number of configurations *per optimizer*. With the
 three configured optimizers, the command evaluates three times that many
-configurations in total.
+configurations in total. Powers of two keep the Sobol balance properties.
 
 Test data is never loaded by this command; see :mod:`gridsearch.data`. Every
 candidate is scored on the same folds with the same per-fold seeding (see
@@ -63,7 +63,7 @@ def _optimizer_for_array_task():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--n-samples", type=int, default=100)
+    parser.add_argument("--n-samples", type=int, default=128)
     parser.add_argument("--num-epochs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-dir", default=str(REPO_ROOT / "data"))

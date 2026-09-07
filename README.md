@@ -15,8 +15,11 @@ src/pcn/          the network and a 3D inference visualizer
 src/comparison/   PCN vs. equivalent MLP, run repeatedly on MNIST
 src/gridsearch/   PCN hyperparameter search
 test/             regression tests for src/pcn
-tools/            one-off scripts (merging grid-search shards)
+tools/            one-off scripts (merging the grid-search tables)
 experiments/      notebooks: PCN on HerzCheck, MNIST, CIFAR-10
+notebooks/        grid-search result analysis
+cluster/          Slurm submission script
+containers/       Singularity definition for the cluster environment
 data/             datasets (gitignored)
 ressources/       background papers (gitignored)
 out/              results from comparison/ and gridsearch/ (gitignored)
@@ -57,19 +60,23 @@ Every trial's summary lands in `out/results.csv`. Its full per-epoch history goe
 
 ## src/gridsearch
 
-`eta_infer`, `T_infer`, `lr`, and `weight_decay` in the notebooks above were hand-picked. This searches them instead.
+The notebooks above use hand-picked values for `eta_infer`, `T_infer`, `lr`, and `weight_decay`. This searches them instead.
 
 ```bash
-uv run pcn-gridsearch                          # 100 samples per optimizer, 5-fold CV
+uv run pcn-gridsearch                          # 128 samples per optimizer, 5-fold CV
 uv run pcn-gridsearch --n-samples 20 --num-epochs 5
 ```
 
-`space.py` draws a separate Latin Hypercube design for each optimizer over the eight non-categorical dimensions: `eta_infer`, `T_infer`, `lr`, `weight_decay`, `negative_slope`, `batch_size`, `hidden_width`, and `n_hidden_layers`. The `--n-samples` value is therefore per optimizer: with Adam, SGD, and Muon, `--n-samples 250` evaluates 750 configurations total. `search.py` scores each candidate with 5-fold cross-validation, all folds shared across every candidate. `data.py` loads only the MNIST train split.
+`space.py` draws a separate scrambled Sobol design for each optimizer over the eight non-categorical dimensions: `eta_infer`, `T_infer`, `lr`, `weight_decay`, `negative_slope`, `batch_size`, `hidden_width`, and `n_hidden_layers`. `--n-samples` counts configurations per optimizer, so with Adam, SGD, and Muon, the default `--n-samples 128` evaluates 384 in total. Keep it a power of two: Sobol points lose their balance properties at other sizes, and scipy warns. `search.py` scores each candidate with 5-fold cross-validation, all folds shared across every candidate. `data.py` loads only the MNIST train split.
 
 Two tables land in `out/gridsearch/`, joinable on `config_id`:
 
 - `folds.csv`: one row per (config, fold), every metric raw. Model from this one.
 - `results.csv`: one row per config, with mean, std, min and max for accuracy, macro F1, cross-entropy, the free energies and the timings.
+
+## notebooks/
+
+`gridsearch.ipynb` reads those two tables and plots the search: the winning configurations and their fold spread, the best score against the number of configurations drawn, per-optimizer Spearman correlations between each hyperparameter and accuracy, the `lr`/`eta_infer` region where training diverges, and median accuracy across the width and depth grid. Run the search first, then the notebook.
 
 ## Cluster
 
@@ -81,23 +88,25 @@ singularity build containers/pcn_uv.sif containers/pcn_uv.def
 
 The Slurm job binds the checkout at `/workspace`, uses the image's pre-synced CUDA 12.8 dependencies, writes CSVs to `out/gridsearch/`, and runs on CUDA. Rebuild the image whenever `pyproject.toml` or `uv.lock` changes.
 
-A single job runs all three optimizers serially and hits the walltime, so the script is a job array with **one task per optimizer**, which is the split the LHS design already uses. Submit it with no arguments:
+A single job runs the three optimizers one after another and hits the walltime, so the script is a job array with **one task per optimizer**, matching the split the Sobol design already uses. Submit it with no arguments:
 
 ```bash
 sbatch cluster/run_pcn_gridsearch.slurm
 ```
 
-Task 0 runs Adam, 1 SGD, 2 Muon, read straight off `space.OPTIMIZERS` — `--optimizer` defaults to `OPTIMIZERS[SLURM_ARRAY_TASK_ID]`. Everything else is set in the script: the `#SBATCH` lines and a `SEARCH_ARGS` line for `--n-samples`/`--num-epochs`. Adding a fourth optimizer to `SEARCH_SPACE` means bumping `--array` to `0-3`; a task warns on startup if the array is too short to cover them all, since the missing optimizer would otherwise only surface as a gap in the merged table. Anything on the `sbatch` line still overrides `SEARCH_ARGS`, for a one-off `sbatch cluster/run_pcn_gridsearch.slurm --num-epochs 5`.
+Task 0 runs Adam, 1 SGD, 2 Muon, taken from `space.OPTIMIZERS`: `--optimizer` defaults to `OPTIMIZERS[SLURM_ARRAY_TASK_ID]`. The script holds the rest, in the `#SBATCH` lines and a `SEARCH_ARGS` line for `--n-samples` and `--num-epochs`.
 
-`--n-samples` is per optimizer, so it is also the per-task config count: 250 samples means each task evaluates 250 configs, a third of the 750-config design.
+Add a fourth optimizer to `SEARCH_SPACE` and you also need to bump `--array` to `0-3`. Forget, and the task warns you at startup, because a short array drops that optimizer and you would find the gap hours later in the merged table. Arguments on the `sbatch` line override `SEARCH_ARGS`, which covers a one-off `sbatch cluster/run_pcn_gridsearch.slurm --num-epochs 5`.
 
-Each task writes its own `folds_<optimizer>.csv` and `results_<optimizer>.csv`, so tasks never clobber one another. Fold them into the two tables the notebooks read once the array finishes:
+Each task evaluates `--n-samples` configurations, so 128 samples gives each task 128 configs, a third of the 384-config design.
+
+Each task writes its own `folds_<optimizer>.csv` and `results_<optimizer>.csv`, so tasks do not clobber one another. Fold them into the two tables the notebooks read once the array finishes:
 
 ```bash
 uv run tools/merge_gridsearch.py
 ```
 
-`config_id` is assigned across the whole design before the optimizer filter, so the merged tables are numbered exactly as an unsplit run would have numbered them. The merge de-duplicates on `config_id`, keeping the most recently written file, so re-running one optimizer (`sbatch --array=2 cluster/run_pcn_gridsearch.slurm`) supersedes its rows instead of double-counting them.
+The runner numbers `config_id` across the whole design before applying the optimizer filter, so the merged tables carry the numbering an unsplit run would produce. The merge de-duplicates on `config_id` and keeps the newest file, so re-running one optimizer (`sbatch --array=2 cluster/run_pcn_gridsearch.slurm`) supersedes its rows instead of double-counting them.
 
 ## Background
 
