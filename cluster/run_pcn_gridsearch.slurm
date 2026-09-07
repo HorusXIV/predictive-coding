@@ -4,7 +4,10 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
+#SBATCH --array=0-2%3
+
+SEARCH_ARGS=(--n-samples 100 --num-epochs 10)
 
 set -euo pipefail
 
@@ -16,4 +19,4 @@ mkdir -p "$PROJECT_ROOT/out/gridsearch"
 singularity run --nv \
     --bind "$PROJECT_ROOT:/workspace" \
     "$CONTAINER_IMAGE" \
-    "$@"
+    "${SEARCH_ARGS[@]}" "$@"

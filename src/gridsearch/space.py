@@ -86,3 +86,16 @@ def dims_for_config(config: dict, input_dim: int) -> tuple[int, ...]:
     """
     widths = [max(16, config["hidden_width"] // 2**i) for i in range(config["n_hidden_layers"])]
     return (input_dim, *widths)
+
+
+def select_configs(n_samples, seed, optimizer=None):
+    """The ``(config_id, config)`` pairs one array task is responsible for.
+
+    ``config_id`` indexes the *whole* design and is assigned before filtering,
+    so one optimizer's rows carry the same ids they would in an unsplit run
+    and join straight onto the merged tables.
+    """
+    configs = list(enumerate(sample_configs(n_samples, seed)))
+    if optimizer:
+        configs = [pair for pair in configs if pair[1]["optimizer"] == optimizer]
+    return configs
