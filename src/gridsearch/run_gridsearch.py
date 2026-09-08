@@ -2,6 +2,10 @@
 score each candidate by 5-fold cross-validation on the MNIST *train* split,
 and write both a per-fold table and a summary table.
 
+Each fold trains for up to ``--num-epochs`` and stops once its own validation
+accuracy has gone ``--patience`` epochs without improving, so folds that
+converge early stop early. The fold row reports its best epoch.
+
 ``--n-samples`` is the number of configurations *per optimizer*. With the
 three configured optimizers, the command evaluates three times that many
 configurations in total. Powers of two keep the Sobol balance properties.
@@ -64,7 +68,8 @@ def _optimizer_for_array_task():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n-samples", type=int, default=128)
-    parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--num-epochs", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-dir", default=str(REPO_ROOT / "data"))
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "out" / "gridsearch")
@@ -93,13 +98,15 @@ def main():
     print(
         f"device={args.device} n_samples_per_optimizer={args.n_samples} "
         f"optimizer={args.optimizer or 'all'} configs={len(configs)} "
-        f"num_epochs={args.num_epochs} "
+        f"num_epochs={args.num_epochs} patience={args.patience} "
         f"train_size={len(dataset)} (5-fold CV, train data only)"
     )
 
     fold_frames, summary_rows = [], []
     for done, (config_id, config) in enumerate(tqdm(configs, desc="configs", unit="cfg"), 1):
-        fold_rows = cross_validate(config, dataset, args.num_epochs, args.device, args.seed)
+        fold_rows = cross_validate(
+            config, dataset, args.num_epochs, args.device, args.seed, args.patience
+        )
 
         labelled = {
             "config_id": config_id,
@@ -114,6 +121,7 @@ def main():
             f"[{done}/{len(configs)}] config_id={config_id} {config}\n"
             f"  val_accuracy={summary['mean_val_accuracy']:.4f} +/- {summary['std_val_accuracy']:.4f}"
             f"  val_f1_macro={summary['mean_val_f1_macro']:.4f} +/- {summary['std_val_f1_macro']:.4f}"
+            f"  best_epoch={summary['mean_best_epoch']:.1f}"
             f"  fit={summary['mean_fit_time_s']:.1f}s"
         )
 

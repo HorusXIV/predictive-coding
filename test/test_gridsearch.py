@@ -4,8 +4,10 @@ from collections import Counter
 
 import torch
 
+from torch.utils.data import TensorDataset
+
 from comparison.models import build_pcn
-from gridsearch.search import _build_optimizer
+from gridsearch.search import N_SPLITS, _build_optimizer, cross_validate
 from gridsearch.space import OPTIMIZERS, sample_configs, select_configs
 
 
@@ -51,6 +53,25 @@ def test_unknown_optimizer_is_rejected():
         assert "Unknown optimizer" in str(error)
     else:
         raise AssertionError("Unknown optimizers must not fall back to SGD")
+
+
+def test_each_fold_stops_after_its_own_patience_runs_out():
+    torch.manual_seed(0)
+    dataset = TensorDataset(torch.rand(60, 784), torch.randint(0, 10, (60,)))
+    config = {
+        "eta_infer": 0.05, "T_infer": 3, "lr": 1e-3, "weight_decay": 1e-3,
+        "negative_slope": 0.1, "batch_size": 16, "hidden_width": 32,
+        "n_hidden_layers": 1, "optimizer": "adam",
+    }
+    num_epochs, patience = 8, 2
+
+    rows = cross_validate(config, dataset, num_epochs, "cpu", seed=0, patience=patience)
+
+    assert len(rows) == N_SPLITS
+    for row in rows:
+        assert 1 <= row["best_epoch"] <= row["epochs_run"] <= num_epochs
+        assert row["epochs_run"] == min(num_epochs, row["best_epoch"] + patience)
+    assert any(row["epochs_run"] < num_epochs for row in rows), "no fold stopped early"
 
 
 if __name__ == "__main__":
