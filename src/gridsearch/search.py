@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Subset
 
 from comparison.models import build_pcn, count_params
 from comparison.seeding import seed_everything
+from pcn.batched import fit_epoch
 
 from .space import dims_for_config
 
@@ -46,14 +47,21 @@ def cross_validate(config, dataset, num_epochs, device, seed, patience) -> list[
     the raw fold-level distribution for later modelling instead of only a mean
     and a standard deviation.
 
-    Each fold trains for at most ``num_epochs`` and stops once its own
-    validation accuracy has failed to improve for ``patience`` consecutive
-    epochs, so a fold that converges early stops without waiting for the
-    others. The row reports the best epoch's metrics rather than the last
-    epoch's, which is the score a restored best-weights checkpoint would give.
-    Selecting the epoch on the same fold the row reports makes ``val_accuracy``
-    mildly optimistic; that is inherent to early stopping on a validation
-    split, and every config pays it equally.
+    The folds train together rather than one after another: they share an
+    architecture, so :func:`pcn.batched.fit_epoch` stacks them and spends one
+    set of kernel launches on all five. Each fold still owns its weights, its
+    optimizer and its data, so the scores match training them separately.
+
+    Each fold stops once its own validation accuracy has failed to improve for
+    ``patience`` consecutive epochs, and drops out of the stack at that point
+    while the others carry on. The row reports the best epoch's metrics rather
+    than the last epoch's, which is the score a restored best-weights
+    checkpoint would give. Selecting the epoch on the same fold the row reports
+    makes ``val_accuracy`` mildly optimistic; that is inherent to early stopping
+    on a validation split, and every config pays it equally.
+
+    ``fit_time_s`` is a shared epoch cost split evenly across the folds
+    training in it, so the five rows still sum to the wall time spent fitting.
 
     ``dataset`` must already be the train split; this function never touches a
     test set. ``seed`` fixes the fold split and each fold's init/data order.
@@ -64,68 +72,81 @@ def cross_validate(config, dataset, num_epochs, device, seed, patience) -> list[
     kfold = KFold(n_splits=N_SPLITS, shuffle=True, random_state=seed)
     dims = dims_for_config(config, INPUT_DIM)
 
-    fold_rows = []
+    models, optimizers, train_loaders, val_loaders = [], [], [], []
     for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(np.arange(len(dataset)))):
+        # Seeded per fold before its weights are drawn, so a fold gets the same
+        # init and the same batch order whether or not it shares a stack.
         generator = seed_everything(seed * 100 + fold_idx)
 
-        train_loader = DataLoader(
+        train_loaders.append(DataLoader(
             Subset(dataset, train_idx),
             batch_size=config["batch_size"],
             shuffle=True,
             generator=generator,
-        )
-        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=256, shuffle=False)
+        ))
+        # 4096: evaluation only accumulates per-batch totals, so a wide batch
+        # changes nothing but float accumulation order, and the GPU is
+        # launch-bound below it.
+        val_loaders.append(DataLoader(Subset(dataset, val_idx), batch_size=4096, shuffle=False))
 
         model = build_pcn(dims, OUTPUT_DIM, negative_slope=config["negative_slope"]).to(device)
-        optimizer = _build_optimizer(config, model)
+        models.append(model)
+        optimizers.append(_build_optimizer(config, model))
 
-        fit_time_s = eval_time_s = 0.0
-        best_metrics, best_epoch, stale = None, 0, 0
+    best = [None] * N_SPLITS
+    best_epoch, epochs_run, stale = [0] * N_SPLITS, [0] * N_SPLITS, [0] * N_SPLITS
+    fit_time_s, eval_time_s = [0.0] * N_SPLITS, [0.0] * N_SPLITS
+    training = list(range(N_SPLITS))
 
-        for epoch in range(1, num_epochs + 1):
-            # One epoch at a time: repeated single-epoch calls advance the
-            # loader and optimizer exactly as one num_epochs call would.
+    for epoch in range(1, num_epochs + 1):
+        if not training:
+            break
+
+        t0 = time.perf_counter()
+        fit_epoch(
+            [models[f] for f in training],
+            [optimizers[f] for f in training],
+            [train_loaders[f] for f in training],
+            eta_infer=config["eta_infer"],
+            T_infer=config["T_infer"],
+            slope=config["negative_slope"],
+            device=device,
+        )
+        shared = (time.perf_counter() - t0) / len(training)
+
+        for fold_idx in list(training):
+            fit_time_s[fold_idx] += shared
+
             t0 = time.perf_counter()
-            model.fit(
-                train_loader,
-                num_epochs=1,
+            metrics = models[fold_idx].evaluate(
+                val_loaders[fold_idx],
                 eta_infer=config["eta_infer"],
                 T_infer=config["T_infer"],
-                optimizer=optimizer,
                 device=device,
-                record_history=False,
-                progress=False,
             )
-            fit_time_s += time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            metrics = model.evaluate(
-                val_loader, eta_infer=config["eta_infer"], T_infer=config["T_infer"], device=device
-            )
-            eval_time_s += time.perf_counter() - t0
+            eval_time_s[fold_idx] += time.perf_counter() - t0
+            epochs_run[fold_idx] = epoch
 
             # A diverged fold scores NaN, which never compares greater, so it
-            # runs out its patience and stops instead of burning every epoch.
-            if best_metrics is None or metrics[_MONITOR] > best_metrics[_MONITOR]:
-                best_metrics, best_epoch, stale = metrics, epoch, 0
+            # runs out its patience and leaves instead of burning every epoch.
+            if best[fold_idx] is None or metrics[_MONITOR] > best[fold_idx][_MONITOR]:
+                best[fold_idx], best_epoch[fold_idx], stale[fold_idx] = metrics, epoch, 0
             else:
-                stale += 1
-                if stale >= patience:
-                    break
+                stale[fold_idx] += 1
+                if stale[fold_idx] >= patience:
+                    training.remove(fold_idx)
 
-        fold_rows.append({
-            "fold": fold_idx,
-            "n_val": best_metrics.pop("n"),
-            "n_params": count_params(model),
-            **{f"val_{k}": v for k, v in best_metrics.items()},
-            "best_epoch": best_epoch,
-            "epochs_run": epoch,
-            "fit_time_s": fit_time_s,
-            "eval_time_s": eval_time_s,
-            "total_time_s": fit_time_s + eval_time_s,
-        })
-
-    return fold_rows
+    return [{
+        "fold": fold_idx,
+        "n_val": best[fold_idx].pop("n"),
+        "n_params": count_params(models[fold_idx]),
+        **{f"val_{k}": v for k, v in best[fold_idx].items()},
+        "best_epoch": best_epoch[fold_idx],
+        "epochs_run": epochs_run[fold_idx],
+        "fit_time_s": fit_time_s[fold_idx],
+        "eval_time_s": eval_time_s[fold_idx],
+        "total_time_s": fit_time_s[fold_idx] + eval_time_s[fold_idx],
+    } for fold_idx in range(N_SPLITS)]
 
 
 def aggregate(fold_rows: list[dict]) -> dict:

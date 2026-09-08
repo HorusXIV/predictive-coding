@@ -38,6 +38,7 @@ array is done.
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 from pathlib import Path
 
@@ -50,6 +51,29 @@ from .search import aggregate, cross_validate
 from .space import OPTIMIZERS, dims_for_config, select_configs
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+# Set once per worker process. One configuration leaves the GPU mostly idle
+# (batch 32 and batch 512 cost the same wall time), so several run at once.
+_WORKER = {}
+
+
+def _init_worker(data_dir, num_epochs, device, seed, patience):
+    # One thread each: the relaxation loop is bound by kernel launches from a
+    # single Python thread, so N workers each grabbing every core only thrash.
+    torch.set_num_threads(1)
+    _WORKER.update(
+        dataset=load_mnist_train(data_dir),
+        num_epochs=num_epochs,
+        device=device,
+        seed=seed,
+        patience=patience,
+    )
+
+
+def _score(indexed_config):
+    config_id, config = indexed_config
+    return config_id, config, cross_validate(config, **_WORKER)
 
 
 def _optimizer_for_array_task():
@@ -70,6 +94,7 @@ def main():
     parser.add_argument("--n-samples", type=int, default=128)
     parser.add_argument("--num-epochs", type=int, default=15)
     parser.add_argument("--patience", type=int, default=4)
+    parser.add_argument("--n-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-dir", default=str(REPO_ROOT / "data"))
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "out" / "gridsearch")
@@ -94,46 +119,56 @@ def main():
     if tasks is not None and int(tasks) != len(OPTIMIZERS):
         print(f"warning: --array covers {tasks} tasks but there are {len(OPTIMIZERS)} optimizers")
 
-    dataset = load_mnist_train(args.data_dir)
     print(
         f"device={args.device} n_samples_per_optimizer={args.n_samples} "
         f"optimizer={args.optimizer or 'all'} configs={len(configs)} "
         f"num_epochs={args.num_epochs} patience={args.patience} "
-        f"train_size={len(dataset)} (5-fold CV, train data only)"
+        f"n_workers={args.n_workers} (5-fold CV, train data only)"
+    )
+
+    # Spawn, not fork: a forked CUDA context is unusable. Each worker loads its
+    # own copy of MNIST rather than having it pickled across the pipe.
+    pool = mp.get_context("spawn").Pool(
+        args.n_workers,
+        _init_worker,
+        (args.data_dir, args.num_epochs, args.device, args.seed, args.patience),
     )
 
     fold_frames, summary_rows = [], []
-    for done, (config_id, config) in enumerate(tqdm(configs, desc="configs", unit="cfg"), 1):
-        fold_rows = cross_validate(
-            config, dataset, args.num_epochs, args.device, args.seed, args.patience
-        )
+    with pool:
+        results = pool.imap_unordered(_score, configs)
+        for done, (config_id, config, fold_rows) in enumerate(
+            tqdm(results, total=len(configs), desc="configs", unit="cfg"), 1
+        ):
+            labelled = {
+                "config_id": config_id,
+                "dims": str(dims_for_config(config, 784)),
+                **config,
+            }
+            fold_frames.append(pd.DataFrame([{**labelled, **row} for row in fold_rows]))
+            summary_rows.append({**labelled, **aggregate(fold_rows)})
 
-        labelled = {
-            "config_id": config_id,
-            "dims": str(dims_for_config(config, 784)),
-            **config,
-        }
-        fold_frames.append(pd.DataFrame([{**labelled, **row} for row in fold_rows]))
-        summary_rows.append({**labelled, **aggregate(fold_rows)})
+            summary = summary_rows[-1]
+            print(
+                f"[{done}/{len(configs)}] config_id={config_id} {config}\n"
+                f"  val_accuracy={summary['mean_val_accuracy']:.4f} +/- {summary['std_val_accuracy']:.4f}"
+                f"  val_f1_macro={summary['mean_val_f1_macro']:.4f} +/- {summary['std_val_f1_macro']:.4f}"
+                f"  best_epoch={summary['mean_best_epoch']:.1f}"
+                f"  fit={summary['mean_fit_time_s']:.1f}s"
+            )
 
-        summary = summary_rows[-1]
-        print(
-            f"[{done}/{len(configs)}] config_id={config_id} {config}\n"
-            f"  val_accuracy={summary['mean_val_accuracy']:.4f} +/- {summary['std_val_accuracy']:.4f}"
-            f"  val_f1_macro={summary['mean_val_f1_macro']:.4f} +/- {summary['std_val_f1_macro']:.4f}"
-            f"  best_epoch={summary['mean_best_epoch']:.1f}"
-            f"  fit={summary['mean_fit_time_s']:.1f}s"
-        )
-
-        # Written every config, so an interrupted search keeps what it finished.
-        folds = pd.concat(fold_frames, ignore_index=True)
-        folds.to_csv(args.out_dir / f"folds{suffix}.csv", index=False)
-        table = (
-            pd.DataFrame(summary_rows)
-            .sort_values("mean_val_accuracy", ascending=False)
-            .reset_index(drop=True)
-        )
-        table.to_csv(args.out_dir / f"results{suffix}.csv", index=False)
+            # Written every config, so an interrupted search keeps what it finished.
+            # Workers finish out of order, so sort back to the sequential layout.
+            folds = pd.concat(fold_frames, ignore_index=True).sort_values(
+                ["config_id", "fold"], ignore_index=True
+            )
+            folds.to_csv(args.out_dir / f"folds{suffix}.csv", index=False)
+            table = (
+                pd.DataFrame(summary_rows)
+                .sort_values("mean_val_accuracy", ascending=False)
+                .reset_index(drop=True)
+            )
+            table.to_csv(args.out_dir / f"results{suffix}.csv", index=False)
 
     print(f"\nbest config:\n{table.iloc[0]}")
     print(f"\n{len(folds)} fold rows -> {args.out_dir / f'folds{suffix}.csv'}")
