@@ -23,13 +23,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Leaky slope keeps the inference gradient alive everywhere. With hard ReLU a
-# non-positive pre-activation zeroes out gain_modulated_error, which blocks the
-# top-down error path entirely: starting the latents at zero leaves every layer
-# above the first pinned at exactly 0.0 forever (measured). That trap is why the
-# old code had to seed the latents with randn -- and that randn seed is what the
-# relaxation never escaped. LeakyReLU removes the trap, so the latents can be
-# initialised deterministically instead. See init_latents.
 NEGATIVE_SLOPE = 0.1
 
 

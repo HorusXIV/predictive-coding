@@ -20,6 +20,7 @@ dependencies = [
     "torch==2.9.1",
     "torchvision==0.24.1",
     "tqdm>=4.69.0",
+    "umap-learn>=0.5.12",
 ]
 
 [project.scripts]

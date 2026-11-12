@@ -5,11 +5,10 @@ from __future__ import annotations
 import time
 
 import numpy as np
-import torch
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Subset
 
-from comparison.models import build_pcn, count_params
+from comparison.models import build_optimizer, build_pcn, count_params
 from comparison.seeding import seed_everything
 from pcn.batched import fit_epoch
 
@@ -25,17 +24,6 @@ _NON_METRIC_KEYS = {"fold", "n_val", "n_params"}
 # Validation metric the early stop watches. Accuracy is what the search ranks
 # on, so stopping on anything else would optimise for a different target.
 _MONITOR = "accuracy"
-
-
-def _build_optimizer(config, model):
-    optimizer = config["optimizer"]
-    if optimizer == "adam":
-        return torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    if optimizer == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    if optimizer == "muon":
-        return torch.optim.Muon(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    raise ValueError(f"Unknown optimizer: {optimizer!r}")
 
 
 def cross_validate(config, dataset, num_epochs, device, seed, patience) -> list[dict]:
@@ -91,7 +79,9 @@ def cross_validate(config, dataset, num_epochs, device, seed, patience) -> list[
 
         model = build_pcn(dims, OUTPUT_DIM, negative_slope=config["negative_slope"]).to(device)
         models.append(model)
-        optimizers.append(_build_optimizer(config, model))
+        optimizers.append(build_optimizer(
+            config["optimizer"], model.parameters(), config["lr"], config["weight_decay"]
+        ))
 
     best = [None] * N_SPLITS
     best_epoch, epochs_run, stale = [0] * N_SPLITS, [0] * N_SPLITS, [0] * N_SPLITS

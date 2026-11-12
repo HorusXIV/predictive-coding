@@ -6,8 +6,8 @@ import torch
 
 from torch.utils.data import TensorDataset
 
-from comparison.models import build_pcn
-from gridsearch.search import N_SPLITS, _build_optimizer, cross_validate
+from comparison.models import build_optimizer, build_pcn
+from gridsearch.search import N_SPLITS, cross_validate
 from gridsearch.space import OPTIMIZERS, sample_configs, select_configs
 from pcn.batched import _init_latents, _relax, _scatter_grads, _stack_weights
 
@@ -40,7 +40,7 @@ def test_config_ids_are_global_so_task_rows_join_across_optimizers():
 
 def test_muon_is_not_silently_treated_as_sgd():
     model = build_pcn((8, 4), output_dim=3)
-    optimizer = _build_optimizer({"optimizer": "muon", "lr": 1e-3, "weight_decay": 1e-2}, model)
+    optimizer = build_optimizer("muon", model.parameters(), lr=1e-3, weight_decay=1e-2)
 
     assert isinstance(optimizer, torch.optim.Muon)
 
@@ -49,7 +49,7 @@ def test_unknown_optimizer_is_rejected():
     model = build_pcn((8, 4), output_dim=3)
 
     try:
-        _build_optimizer({"optimizer": "not-an-optimizer", "lr": 1e-3, "weight_decay": 1e-2}, model)
+        build_optimizer("not-an-optimizer", model.parameters(), lr=1e-3, weight_decay=1e-2)
     except ValueError as error:
         assert "Unknown optimizer" in str(error)
     else:
